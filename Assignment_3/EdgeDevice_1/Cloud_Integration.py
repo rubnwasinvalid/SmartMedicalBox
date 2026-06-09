@@ -6,70 +6,88 @@ import requests
 from icalendar import Calendar
 from datetime import datetime, timedelta, timezone
 
-# ── MQTT Configuration (ThingsBoard) ──────────────────────────────────────────
+# -- MQTT Configuration (ThingsBoard) ------------------------------------------------------------------------
+#MQTT broker details
 BROKER = "mqtt.thingsboard.cloud"
 PORT = 1883
 USERNAME  = "SmartBox"
+
+#MQTT topics
 TOPIC_TELEMETRY = "v1/devices/me/telemetry"
 TOPIC_RPC_REQ = "v1/devices/me/rpc/request/+"
 TOPIC_RPC_RESP = "v1/devices/me/rpc/response/{}"
 
-# ── Database Configuration ────────────────────────────────────────────────────
+# -- Database Configuration ------------------------------------------------------------------------
 DB_CONFIG = dict(host="localhost", user="pi", password="", database="IOT_LOCKBOX")
 
-# ── Timers ────────────────────────────────────────────────────────────────────
+# -- Timers ------------------------------------------------------------------------
 TELEMETRY_INTERVAL = 5   # publish live sensor data every 5 seconds
 ANALYTICS_INTERVAL = 30  # publish 24h analytics every 30 seconds
 
-# == Calendar =================================================================
+# -- Calendar ------------------------------------------------------------------------
 CALENDAR_ICAL_URL = "https://calendar.google.com/calendar/ical/d3f4e56bb2aacfe18e1c4f197e5b1c08db4d5f1109f3be2b555cb683d826b46d%40group.calendar.google.com/public/basic.ics"
 CALENDAR_INTERVAL = 60   # check every 60 seconds
-DOSE_WINDOW_MIN  = 5    # alert if dose is within next 5 minutes
+DOSE_WINDOW_MIN  = 5   # alert if dose is within next 5 minutes
 
-#helper
+#helper function to extract value from RPC parameters
 def extract_value(params, default=None):
     if isinstance(params, dict):
         return params.get("value", default)
     return params
 
-# ── Callback functions ────────────────────────────────────────────────────────
+# -- Callback functions ------------------------------------------------------------------------
+
+#when MQTT connects successfully
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code", rc)
-    client.subscribe(TOPIC_RPC_REQ)
+    client.subscribe(TOPIC_RPC_REQ) #sub to RPC requests
+
 
 def on_message(client, userdata, msg):
     print(msg.topic + " " + str(msg.payload))
 
     try:
+        #extract request ID
         request_id = msg.topic.split("/")[-1]
+
+        #Parse JSON payload
         payload = json.loads(msg.payload.decode())
         method = payload.get("method", "")
         params = payload.get("params", {})
 
+        #Connect to database
         dbconn = pymysql.connect(**DB_CONFIG)
         cursor = dbconn.cursor()
 
+        #lock command recieved
         if method == "lock":
             cursor.execute("INSERT INTO commands (command) VALUES ('LOCK')")
             cursor.execute("INSERT INTO access_log (action, method) VALUES ('LOCK','CLOUD')")
 
+        #unlock command
         elif method == "unlock":
             cursor.execute("INSERT INTO commands (command) VALUES ('UNLOCK')")
             cursor.execute("INSERT INTO access_log (action, method) VALUES ('UNLOCK','CLOUD')")
 
+        #mute button 
         elif method == "mute_alarm":
             cursor.execute("INSERT INTO commands (command) VALUES ('MUTE')")
 
+        #clear all active alarms
         elif method == "clear_all_alarms":
             cursor.execute("INSERT INTO commands (command) VALUES ('CLEAR_ALL')")
 
+        #update max temperature threshold
         elif method == "set_temp_max":
             value = float(extract_value(params, 30))
             cursor.execute("REPLACE INTO thresholds (param, value) VALUES ('TEMP_MAX', %s)", (value,))
             dbconn.commit()
 
+            #publish updated threshold
             client.publish( TOPIC_TELEMETRY, json.dumps({"thresh_temp_max": value}))
          
+
+         #update min temp threshold
         elif method == "set_temp_min":
             value = float(extract_value(params, 15))
             cursor.execute( "REPLACE INTO thresholds (param, value) VALUES ('TEMP_MIN', %s)", (value,))
@@ -77,6 +95,8 @@ def on_message(client, userdata, msg):
 
             client.publish(TOPIC_TELEMETRY, json.dumps({ "thresh_temp_min": value }))
 
+
+        #update max humidity threshold
         elif method == "set_hum_max":
             value = float(extract_value(params, 70))
             cursor.execute("REPLACE INTO thresholds (param, value) VALUES ('HUM_MAX', %s)", (value,) )
@@ -84,7 +104,7 @@ def on_message(client, userdata, msg):
 
             client.publish(TOPIC_TELEMETRY, json.dumps({ "thresh_hum_max": value }))
 
-
+        #update min humidity threshold
         elif method == "set_hum_min":
             value = float(extract_value(params, 40))
             cursor.execute("REPLACE INTO thresholds (param, value) VALUES ('HUM_MIN', %s)", (value,))
@@ -92,6 +112,7 @@ def on_message(client, userdata, msg):
 
             client.publish(TOPIC_TELEMETRY, json.dumps({ "thresh_hum_min": value}))
 
+        #update light threshold
         elif method == "set_ldr_max":
             value = float(extract_value(params, 25))
             cursor.execute("REPLACE INTO thresholds (param, value) VALUES ('LDR_MAX', %s)", (value,))
@@ -99,7 +120,7 @@ def on_message(client, userdata, msg):
 
             client.publish(TOPIC_TELEMETRY, json.dumps({ "thresh_ldr_max": value}))
 
-        dbconn.commit()
+        dbconn.commit() #commit changes
         cursor.close()
         dbconn.close()
 
@@ -108,14 +129,19 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print("RPC error:", e)
 
+
+#check google calandar for medication doses due soon
 def check_upcoming_doses():
     global current_dose_alert
     try:
+
+        #download calandar feed 
         r = requests.get(CALENDAR_ICAL_URL, timeout=10)
         if r.status_code != 200:
             print(f"Calendar fetch failed: HTTP {r.status_code}")
             return
 
+        #parse data
         cal = Calendar.from_ical(r.text)
         now = datetime.now(timezone.utc)
         soon = now + timedelta(minutes=DOSE_WINDOW_MIN)
@@ -136,7 +162,7 @@ def check_upcoming_doses():
     except Exception as e:
         print(f"Calendar check error: {e}")
 
-# ── Initialize MQTT client ────────────────────────────────────────────────────
+#-- Initialize MQTT client ------------------------------------------------------------------------
 client = mqtt.Client()
 client.username_pw_set(USERNAME)
 client.on_connect = on_connect
@@ -144,7 +170,7 @@ client.on_message = on_message
 client.connect(BROKER, PORT, 60)
 client.loop_start()
 
-# ── Timers ────────────────────────────────────────────────────────────────────
+# --Timers ------------------------------------------------------------------------
 last_telemetry = 0
 last_analytics = 0
 last_calendar_check = 0
@@ -155,20 +181,25 @@ try:
     while True:
         now = time.time()
 
-        # ── Publish live sensor data every 5 seconds ──────────────────────
+        # -- Publish live sensor data every 5 seconds -----------------------------------------------
         if now - last_telemetry >= TELEMETRY_INTERVAL:
             dbconn = pymysql.connect(**DB_CONFIG)
             cursor = dbconn.cursor()
 
+            #get last sensor reading
             cursor.execute(
                 "SELECT light, temperature, humidity FROM sensor_data "
                 "ORDER BY timestamp DESC LIMIT 1"
             )
             row = cursor.fetchone()
 
+
+            #get configured thresholds
             cursor.execute("SELECT param, value FROM thresholds")
             t = {r[0]: r[1] for r in cursor.fetchall()}
 
+
+            #determing lock state
             cursor.execute(
                 "SELECT action FROM access_log ORDER BY timestamp DESC LIMIT 1"
             )
@@ -186,6 +217,7 @@ try:
             if row:
                 light, temp, hum = row[0], row[1], row[2]
 
+                #build list of active alarms
                 active_alarms = []
                 if temp < t.get("TEMP_MIN", 15) or temp > t.get("TEMP_MAX", 30):
                     active_alarms.append("TEMPERATURE")
@@ -214,20 +246,22 @@ try:
                 })
 
                 print("Publishing telemetry:", payload)
-                client.publish(TOPIC_TELEMETRY, payload)
+                client.publish(TOPIC_TELEMETRY, payload) #send to thingsboard
 
             last_telemetry = now
 
-        # ── Publish 24h analytics ────────────────────────
+        # -- Publish 24h analytics-------------------------------------------------------------------
         if now - last_analytics >= ANALYTICS_INTERVAL:
             dbconn = pymysql.connect(**DB_CONFIG)
             cursor = dbconn.cursor()
 
+            #average sensor value over 24 hours
             cursor.execute("""SELECT AVG(light), AVG(temperature), AVG(humidity)
                               FROM sensor_data
                               WHERE timestamp >= NOW() - INTERVAL 24 HOUR""")
             r = cursor.fetchone()
 
+            #alarms in last 24 hours
             cursor.execute("""SELECT alarm_type, COUNT(*) FROM alarms
                               WHERE timestamp >= NOW() - INTERVAL 24 HOUR
                               GROUP BY alarm_type""")
@@ -246,7 +280,7 @@ try:
             client.publish(TOPIC_TELEMETRY, analytics)
             last_analytics = now
 
-        # ── Check calendar for upcoming doses ────────────────────────────────
+        # -- Check calendar for upcoming doses -----------------------------------
         if now - last_calendar_check >= CALENDAR_INTERVAL:
             check_upcoming_doses()
             last_calendar_check = now
